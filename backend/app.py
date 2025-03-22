@@ -4,6 +4,7 @@ eventlet.monkey_patch()  # 必须在所有其他导入之前执行
 from flask import Flask, send_from_directory, request
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import time
+from models import Session, User
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'  # 添加密钥
@@ -24,6 +25,26 @@ DIST_DIR = '../frontend/dist'
 def get_real_ip():
     return request.remote_addr
 
+def get_or_create_user(ip):
+    session = Session()
+    try:
+        user = session.query(User).filter_by(ip=ip).first()
+        if not user:
+            user = User(ip=ip, nickname=ip)
+            session.add(user)
+            session.commit()
+        return user
+    finally:
+        session.close()
+
+def get_nickname(ip):
+    session = Session()
+    try:
+        user = session.query(User).filter_by(ip=ip).first()
+        return user.nickname if user else ip
+    finally:
+        session.close()
+
 @app.route('/')
 def index():
     return send_from_directory(DIST_DIR, 'index.html')
@@ -39,20 +60,20 @@ def static_files(path):
 
 @socketio.on('connect')
 def handle_connect():
-    # 打印关键信息
-    # print("=" * 50)
-    # print("Request Headers:", dict(request.headers))
-    # print("Remote Address (直接来源):", request.remote_addr)
-    # print("X-Forwarded-For 头:", request.headers.get('X-Forwarded-For'))
-    # print("X-Real-IP 头:", request.headers.get('X-Real-IP'))
-    # print("=" * 50)
-
     ip_address = get_real_ip()
     users[ip_address] = request.sid
     last_heartbeat[ip_address] = time.time()
-    emit('your_ip', ip_address)  # 发送客户端的IP地址
-    emit('user_connected', ip_address, broadcast=True)
-    emit('update_user_list', list(users.keys()), broadcast=True)  # 更新用户列表
+    user = get_or_create_user(ip_address)
+    emit('your_ip', {'ip': ip_address, 'nickname': user.nickname})
+    emit('user_connected', {'ip': ip_address, 'nickname': user.nickname}, broadcast=True)
+    # 发送所有在线用户及其昵称
+    online_users = []
+    for ip in users.keys():
+        online_users.append({
+            'ip': ip,
+            'nickname': get_nickname(ip)
+        })
+    emit('update_user_list', online_users, broadcast=True)
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -126,6 +147,53 @@ def handle_chunk_ack(data):
 @socketio.on('update_user_list')
 def handle_update_user_list():
     emit('update_user_list', list(users.keys()), broadcast=True)
+
+@socketio.on('file_start')
+def handle_file_start(data):
+    recipient_ip = data['recipient']
+    if recipient_ip in users:
+        emit('file_start', {
+            'sender': get_real_ip(),
+            'fileInfo': data['fileInfo']
+        }, room=users[recipient_ip])
+
+@socketio.on('file_data')
+def handle_file_data(data):
+    recipient_ip = data['recipient']
+    if recipient_ip in users:
+        emit('file_data', {
+            'sender': get_real_ip(),
+            'name': data['name'],
+            'data': data['data']
+        }, room=users[recipient_ip])
+        return True  # 确认数据已发送
+
+@socketio.on('file_end')
+def handle_file_end(data):
+    recipient_ip = data['recipient']
+    if recipient_ip in users:
+        emit('file_end', {
+            'sender': get_real_ip(),
+            'name': data['name']
+        }, room=users[recipient_ip])
+
+@socketio.on('update_nickname')
+def handle_nickname_update(data):
+    ip = get_real_ip()
+    new_nickname = data['nickname']
+    session = Session()
+    try:
+        user = session.query(User).filter_by(ip=ip).first()
+        if user:
+            user.nickname = new_nickname
+        else:
+            user = User(ip=ip, nickname=new_nickname)
+            session.add(user)
+        session.commit()
+        # 广播昵称更新
+        emit('nickname_updated', {'ip': ip, 'nickname': new_nickname}, broadcast=True)
+    finally:
+        session.close()
 
 def check_heartbeat():
     app_context = app.app_context()

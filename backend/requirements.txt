@@ -1,13 +1,7 @@
-#Flask==2.1.1
-#Flask-SocketIO==5.2.0
-#eventlet==0.33.1
-#werkzeug==2.1.2
-#setuptools==58.0.4
-#distlib==0.3.6
-
 Flask==2.0.2
 Flask-SocketIO==5.1.1
 eventlet==0.39.0
 werkzeug==2.0.2
 setuptools==58.0.4
 dnspython==2.2.1
+SQLAlchemy==1.4.51

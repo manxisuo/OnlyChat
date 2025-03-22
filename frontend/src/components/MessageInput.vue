@@ -1,160 +1,316 @@
 <template>
   <div class="message-input">
-    <el-input v-model="message" @keyup.enter.native="sendMessage" placeholder="输入消息..." />
-    <el-upload
-      class="upload-demo"
-      drag
-      action=""
-      :auto-upload="false"
-      :on-change="sendFile">
-      <i class="el-icon-upload"></i>
-      <div class="el-upload__text">拖拽文件到此处，或<em>点击上传</em></div>
-    </el-upload>
-    <el-button type="primary" @click="sendMessage">发送</el-button>
-    <el-dialog title="发送文件" :visible.sync="showSendProgress" :show-close="false" :close-on-click-modal="false" width="30%">
-      <el-progress :percentage="sendProgress" :format="format"></el-progress>
-      <div>正在发送: {{currentSendingFile}}</div>
-    </el-dialog>
+    <div class="input-area">
+      <!-- 普通文本模式 -->
+      <el-input v-if="!isMarkdownMode"
+                v-model="message"
+                type="textarea"
+                :rows="3"
+                @keydown.enter.native="handleEnter"
+                @keydown.enter.native.ctrl.prevent="sendMessage"
+                placeholder="输入消息... (Ctrl + Enter 发送，Enter 换行)" />
+
+      <!-- Markdown模式 -->
+      <editor v-else
+              ref="editor"
+              :initialValue="message"
+              :options="editorOptions"
+              height="150px"
+              @change="handleChange"
+              @keydown="handleEditorKeydown" />
+
+      <div class="action-buttons">
+        <div class="left-buttons">
+          <el-checkbox v-model="isMarkdownMode">
+            <el-tooltip content="切换Markdown编辑模式" placement="top">
+              <span>Markdown模式</span>
+            </el-tooltip>
+          </el-checkbox>
+        </div>
+        <div class="right-buttons">
+          <el-upload
+            class="upload-inline"
+            action=""
+            :auto-upload="false"
+            :show-file-list="false"
+            :on-change="sendFile">
+            <el-button icon="el-icon-paperclip" type="text"></el-button>
+          </el-upload>
+          <el-button type="primary" @click="sendMessage">发送</el-button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script>
+import { Editor } from '@toast-ui/vue-editor'
+import 'codemirror/lib/codemirror.css'
+import '@toast-ui/editor/dist/toastui-editor.css'
+
 export default {
+  components: {
+    editor: Editor
+  },
+  props: {
+    currentRecipient: String  // 添加 prop
+  },
   data() {
     return {
       message: '',
-      chunkSize: 5 * 1024 * 1024,
-      showSendProgress: false,
-      sendProgress: 0,
-      currentSendingFile: ''
+      isMarkdownMode: false,
+      currentSendingFile: '',
+      abortController: null,
+      editorOptions: {
+        hideModeSwitch: true,
+        toolbarItems: [],
+        placeholder: '输入消息... (Ctrl + Enter 发送，Enter 换行)'
+      }
     }
   },
   methods: {
     format(percentage) {
       return percentage === 100 ? '完成' : `${percentage}%`
     },
+    handleEnter(e) {
+      if (e.ctrlKey) {
+        e.preventDefault()
+        this.sendMessage()
+      }
+      // 普通 Enter 键不处理，让它自然换行
+    },
+    handleChange() {
+      if (this.isMarkdownMode) {
+        this.message = this.$refs.editor.invoke('getMarkdown')
+      }
+    },
+    handleEditorKeydown(event) {
+      if (event.key === 'Enter' && event.ctrlKey) {
+        event.preventDefault()
+        this.sendMessage()
+      }
+    },
     sendMessage() {
-      if (this.message.trim() !== '') {
-        this.$emit('sendMessage', this.message)
+      const message = this.message.trim()
+      if (message) {
+        this.$emit('sendMessage', this.isMarkdownMode ? {
+          type: 'markdown',
+          content: message
+        } : message)
+
+        // 清空输入
+        if (this.isMarkdownMode) {
+          this.$refs.editor.invoke('setMarkdown', '')
+        }
         this.message = ''
       }
     },
     async sendFile(file) {
-      const currentRecipient = this.$parent.$parent.currentRecipient
-      if (!currentRecipient) {
+      if (!this.currentRecipient) {  // 使用 prop
         this.$message.error('请先选择接收者')
         return
       }
 
-      console.log('Starting file transfer:', file.raw.name)  // 添加日志
+      // 添加进度条消息
+      const progressMessage = {
+        sender: 'me',
+        type: 'progress',
+        fileName: file.raw.name,
+        progress: 0,
+        status: ''
+      }
+      this.$emit('sendMessage', progressMessage)
 
-      // 发送文件开始信息
-      this.$socket.emit('send_file_start', {
-        recipient: currentRecipient,
-        fileInfo: {
-          name: file.raw.name,
-          size: file.raw.size,
-          type: file.raw.type
-        }
-      })
-
-      const totalChunks = Math.ceil(file.raw.size / this.chunkSize)
-      const chunkTimeout = 15000;  // 增加到15秒
-      let lastProgress = 0;
-
-      this.showSendProgress = true
-      this.sendProgress = 0
-      this.currentSendingFile = file.raw.name
-      
       try {
-        for (let i = 0; i < totalChunks; i++) {
-          const chunk = file.raw.slice(
-            i * this.chunkSize,
-            Math.min(file.raw.size, (i + 1) * this.chunkSize)
-          )
-          
-          const chunkData = await new Promise((resolve) => {
-            const reader = new FileReader()
-            reader.onload = (e) => resolve(e.target.result)
-            reader.readAsArrayBuffer(chunk)  // 改用 readAsArrayBuffer
-          })
+        // 创建 ReadableStream
+        const stream = file.raw.stream()
+        const reader = stream.getReader()
+        const fileSize = parseInt(file.raw.size)
+        let bytesRead = 0
 
+        // 发送文件信息
+        this.$socket.emit('file_start', {
+          recipient: this.currentRecipient,  // 使用 prop
+          fileInfo: {
+            name: file.raw.name,
+            size: fileSize,
+            type: file.raw.type
+          }
+        })
+
+        // 开始读取流
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          // 发送数据块
           await new Promise((resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-              this.$socket.off('chunk_received', onReceived)
-              this.$socket.off('chunk_error', onError)
-              reject(new Error('发送超时，请重试'))
-            }, chunkTimeout)
+            const timeoutId = setTimeout(() => reject(new Error('发送超时')), 5000)
 
-            const onReceived = (data) => {
-              if (data.index === i) {
-                clearTimeout(timeoutId)
-                this.$socket.off('chunk_received', onReceived)
-                this.$socket.off('chunk_error', onError)
-                resolve()
-              }
-            }
-            
-            const onError = (data) => {
-              if (data.index === i) {
-                clearTimeout(timeoutId)
-                this.$socket.off('chunk_received', onReceived)
-                this.$socket.off('chunk_error', onError)
-                reject(new Error(data.error))
-              }
-            }
-
-            this.$socket.on('chunk_received', onReceived)
-            this.$socket.on('chunk_error', onError)
-            
-            this.$socket.emit('send_file_chunk', {
-              recipient: currentRecipient,
-              chunk: {
-                name: file.raw.name,
-                data: chunkData,
-                index: i,
-                total: totalChunks
-              }
+            this.$socket.emit('file_data', {
+              recipient: this.currentRecipient,  // 使用 prop
+              name: file.raw.name,
+              data: value
+            }, () => {
+              clearTimeout(timeoutId)
+              resolve()
             })
           })
 
-          // 更新进度
-          this.sendProgress = Math.round((i + 1) / totalChunks * 100)
+          bytesRead += value.byteLength // 使用byteLength而不是length
+          const progress = Math.min(100, Math.round((bytesRead / fileSize) * 100))
           
-          // 检查进度是否停滞
-          if (this.sendProgress === lastProgress) {
-            console.warn('Progress stalled, waiting...')
-            await new Promise(resolve => setTimeout(resolve, 1000))
+          // 更新进度条消息
+          progressMessage.progress = progress
+          if (progress === 100) {
+            progressMessage.status = 'success'
           }
-          lastProgress = this.sendProgress
-
-          // 每个块发送后稍微等待一下
-          await new Promise(resolve => setTimeout(resolve, 100))
         }
 
-        this.showSendProgress = false
-        console.log('File transfer completed')
-        this.$message({
-          message: '文件发送完成',
-          type: 'success'
+        // 发送完成信号
+        this.$socket.emit('file_end', {
+          recipient: this.currentRecipient,  // 使用 prop
+          name: file.raw.name
         })
+
+        // 添加完成消息
+        this.$emit('sendMessage', `文件: ${file.raw.name}已发送`)
+
       } catch (error) {
-        this.showSendProgress = false
-        console.error('File transfer failed:', error)  // 添加错误日志
+        // 更新进度条状态为失败
+        progressMessage.status = 'exception'
+        progressMessage.progress = 100
+        
+        console.error('文件发送失败:', error)
         this.$message.error('文件发送失败')
       }
+    }
+  },
+  watch: {
+    isMarkdownMode(newVal) {
+      // 切换模式时保留内容
+      this.$nextTick(() => {
+        if (newVal && this.$refs.editor) {
+          this.$refs.editor.invoke('setMarkdown', this.message)
+        }
+      })
     }
   }
 }
 </script>
 
-<style>
+<style scoped>
 .message-input {
+  width: 100%;
+  box-sizing: border-box;  /* 确保padding计入宽度 */
+}
+
+.input-area {
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border: 1px solid #dcdfe6;
+  border-radius: 4px;
+  overflow: hidden;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.action-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px;
+  border-top: 1px solid #ebeef5;
+}
+
+.left-buttons, .right-buttons {
   display: flex;
   align-items: center;
 }
-.message-input .el-input {
-  flex: 1;
-  margin-right: 10px;
+
+.right-buttons {
+  gap: 8px;
+}
+
+:deep(.toastui-editor-defaultUI) {
+  border: none;
+  max-height: 200px;  /* 设置最大高度 */
+}
+
+:deep(.toastui-editor-defaultUI .ProseMirror) {
+  min-height: 130px;  /* 设置最小高度 */
+  padding: 12px 15px;  /* 调整内边距 */
+}
+
+.input-area :deep(.el-input) {
+  width: 100%;  /* 确保输入框占满剩余空间 */
+}
+
+.input-area :deep(.el-input__inner) {
+  border-right: none;
+  padding-right: 0;
+}
+
+.input-area :deep(.el-input-group__append) {
+  white-space: nowrap;  /* 防止按钮换行 */
+  position: relative;  /* 确保显示在正确位置 */
+  right: 0;
+}
+
+.upload-inline {
+  display: inline-flex;  /* 改为inline-flex */
+  align-items: center;
+  border-left: 1px solid #DCDFE6;
+  height: 32px;
+  padding: 0 8px;
+  margin: 0;
+}
+
+.upload-inline :deep(.el-upload) {
+  display: block;
+}
+
+.upload-inline :deep(.el-upload-dragger) {
+  display: none;
+}
+
+.upload-inline :deep(.el-button) {
+  height: 32px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 0;
+}
+
+.upload-inline :deep(.el-icon-paperclip) {
+  font-size: 18px;
+  color: #909399;
+}
+
+.upload-inline :deep(.el-button):hover .el-icon-paperclip {
+  color: #409EFF;
+}
+
+.el-button {
+  height: 32px;
+  margin: 0;
+  padding: 8px 15px;
+  border: none;
+  font-size: 14px;
+}
+
+:deep(.el-dialog__body) {
+  padding: 20px;
+}
+
+:deep(.el-textarea__inner) {
+  border: none;
+  resize: none;
+  min-height: 130px;
+  padding: 12px 15px;
+}
+
+:deep(.el-checkbox) {
+  margin-right: 16px;
 }
 </style>
